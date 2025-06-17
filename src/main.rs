@@ -9,6 +9,7 @@ use tokio::sync::Semaphore;
 use tokio::task;
 use scraper::{Html, Selector};
 use libc;
+use url::Url;
 
 #[derive(Serialize, Deserialize, Clone)]
 struct RequestResult {
@@ -18,6 +19,7 @@ struct RequestResult {
     content_length: u64,
     word_count: usize,
     error: Option<String>,
+    location: Option<String>,
 }
 
 impl RequestResult {
@@ -33,8 +35,9 @@ impl RequestResult {
     }
 
     fn to_debug_format(&self, a_result: &RequestResult, b_result: &RequestResult, title: &str) -> String {
+        let location = self.location.as_deref().map(|l| format!("Location: {}", l)).unwrap_or_default();
         format!(
-            "{} {} {} {} {} (A: {} CL:{} WC:{}, B: {} CL:{} WC:{}, C: {} CL:{} WC:{}) \"{}\"",
+            "{} {} {} {} {} (A: {} CL:{} WC:{}, B: {} CL:{} WC:{}, C: {} CL:{} WC:{}) \"{}\" \"{}\"",
             self.host,
             self.url,
             self.status_code,
@@ -43,7 +46,8 @@ impl RequestResult {
             a_result.status_code, a_result.content_length, a_result.word_count,
             b_result.status_code, b_result.content_length, b_result.word_count,
             self.status_code, self.content_length, self.word_count,
-            title
+            title,
+            location
         )
     }
 }
@@ -124,57 +128,118 @@ fn configure_system(verbose: bool) -> io::Result<()> {
 }
 
 async fn send_request(client: &Client, url: String, host: Option<&str>, verbose: bool) -> RequestResult {
-    let mut attempts = 0;
-    let max_retries = 0; // Disable retries for speed
-    loop {
-        let mut request = client
-            .get(&url)
-            .header("User-Agent", "Mozilla/5.0 (compatible; sorted-vhost/1.0)")
-            .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-            .header("Connection", "keep-alive");
-        if let Some(host) = host {
-            request = request.header("Host", host);
-        }
-        match request.send().await {
-            Ok(response) => {
-                let status = response.status().as_u16();
-                let content_length = response
+    let mut request = client
+        .get(&url)
+        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
+        .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8")
+        .header("Accept-Language", "en-US,en;q=0.5")
+        .header("Connection", "keep-alive");
+    if let Some(host) = host {
+        request = request.header("Host", host);
+    }
+    match request.send().await {
+        Ok(response) => {
+            let status = response.status().as_u16();
+            let content_length = response
+                .headers()
+                .get("Content-Length")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0);
+            let location = if status == 301 {
+                response
                     .headers()
-                    .get("Content-Length")
+                    .get("Location")
                     .and_then(|v| v.to_str().ok())
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .unwrap_or(0);
-                return RequestResult {
-                    host: host.unwrap_or("").to_string(),
-                    url,
-                    status_code: status,
-                    content_length,
-                    word_count: 0, // Defer word count to filtering stage
-                    error: None,
-                };
+                    .map(String::from)
+            } else {
+                None
+            };
+            RequestResult {
+                host: host.unwrap_or("").to_string(),
+                url,
+                status_code: status,
+                content_length,
+                word_count: 0,
+                error: None,
+                location,
             }
-            Err(e) => {
-                attempts += 1;
-                let error = e.to_string();
-                if attempts > max_retries {
+        }
+        Err(e) => {
+            let error = e.to_string();
+            if verbose {
+                eprintln!("Request to {} failed: {}", url, error);
+            }
+            RequestResult {
+                host: host.unwrap_or("").to_string(),
+                url,
+                status_code: 0,
+                content_length: 0,
+                word_count: 0,
+                error: Some(error),
+                location: None,
+            }
+        }
+    }
+}
+
+fn get_apex_domain(url: &str) -> Option<String> {
+    Url::parse(url)
+        .ok()
+        .and_then(|u| u.domain().map(|d| d.to_string()))
+        .and_then(|d| {
+            let parts: Vec<&str> = d.split('.').collect();
+            if parts.len() >= 2 {
+                Some(format!("{}.{}", parts[parts.len() - 2], parts[parts.len() - 1]))
+            } else {
+                None
+            }
+        })
+}
+
+async fn follow_redirect(client: &Client, base_url: &str, location: &str, host: &str, verbose: bool) -> RequestResult {
+    let redirect_url = match Url::parse(location) {
+        Ok(url) => url.to_string(),
+        Err(_) => {
+            // Handle relative URLs
+            match Url::parse(base_url).and_then(|base| base.join(location)) {
+                Ok(url) => url.to_string(),
+                Err(e) => {
                     if verbose {
-                        eprintln!("Request to {} failed: {}", url, error);
+                        eprintln!("Failed to parse redirect URL {} from base {}: {}", location, base_url, e);
                     }
                     return RequestResult {
-                        host: host.unwrap_or("").to_string(),
-                        url,
+                        host: host.to_string(),
+                        url: location.to_string(),
                         status_code: 0,
                         content_length: 0,
                         word_count: 0,
-                        error: Some(error),
+                        error: Some(e.to_string()),
+                        location: None,
                     };
                 }
-                if verbose {
-                    eprintln!("Retrying request to {} (attempt {}): {}", url, attempts, error);
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
         }
+    };
+
+    // Check if redirect is on the same site
+    let base_apex = get_apex_domain(base_url);
+    let redirect_apex = get_apex_domain(&redirect_url);
+    let is_same_site = base_apex.is_some() && redirect_apex.is_some() && base_apex == redirect_apex;
+
+    let redirect_result = send_request(client, redirect_url.clone(), None, verbose).await;
+    if redirect_result.status_code == 200 && is_same_site {
+        RequestResult {
+            host: host.to_string(),
+            url: redirect_url,
+            status_code: 999, // Special code to indicate skip
+            content_length: 0,
+            word_count: 0,
+            error: None,
+            location: None,
+        }
+    } else {
+        redirect_result
     }
 }
 
@@ -206,31 +271,6 @@ async fn calculate_word_count_and_title(body: &str, verbose: bool) -> (usize, St
         });
 
     (word_count, title)
-}
-
-async fn calculate_word_count(client: &Client, url: &str, host: Option<&str>, verbose: bool) -> usize {
-    let mut request = client
-        .get(url)
-        .header("User-Agent", "Mozilla/5.0 (compatible; sorted-vhost/1.0)")
-        .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-        .header("Connection", "keep-alive");
-    if let Some(host) = host {
-        request = request.header("Host", host);
-    }
-    if let Ok(response) = request.send().await {
-        let is_html = response
-            .headers()
-            .get("Content-Type")
-            .map(|ct| ct.to_str().unwrap_or("").contains("text/html"))
-            .unwrap_or(false);
-        if is_html {
-            if let Ok(body) = response.text().await {
-                let (word_count, _) = calculate_word_count_and_title(&body, verbose).await;
-                return word_count;
-            }
-        }
-    }
-    0
 }
 
 fn is_valid_status(status: u16) -> bool {
@@ -283,7 +323,7 @@ async fn main() -> io::Result<()> {
         .unwrap()
         .parse()
         .unwrap_or(100)
-        .min(500); // Lower cap to 500
+        .min(500);
 
     if concurrency > 500 && verbose {
         eprintln!("Warning: Concurrency capped at 500 to prevent resource exhaustion.");
@@ -293,7 +333,7 @@ async fn main() -> io::Result<()> {
 
     let client = ClientBuilder::new()
         .danger_accept_invalid_certs(true)
-        .timeout(std::time::Duration::from_secs(3)) // Reduced timeout
+        .timeout(std::time::Duration::from_secs(5)) // Increased to 5s
         .build()
         .expect("Failed to build HTTP client");
     let client = Arc::new(client);
@@ -318,15 +358,19 @@ async fn main() -> io::Result<()> {
         let http_url = format!("http://{}", host);
         let task = task::spawn(async move {
             let _permit = semaphore.acquire().await.unwrap();
-            let a_https = send_request(&client, https_url.clone(), None, verbose);
+            let a_https = send_request(&client, https_url.clone(), None, verbose).await;
+            let mut a_result = a_https;
+            if a_result.status_code == 301 {
+                if let Some(location) = &a_result.location {
+                    a_result = follow_redirect(&client, &https_url, location, &host, verbose).await;
+                }
+            } else if a_result.status_code == 0 {
+                a_result = send_request(&client, http_url, None, verbose).await;
+            }
+
             let b = send_request(&client, url.clone(), None, verbose);
             let c = send_request(&client, url.clone(), Some(&host), verbose);
-            let (a_https_result, b_result, c_result) = tokio::join!(a_https, b, c);
-            let a_result = if a_https_result.status_code == 0 {
-                send_request(&client, http_url, None, verbose).await
-            } else {
-                a_https_result
-            };
+            let (b_result, c_result) = tokio::join!(b, c);
             (host, url, a_result, b_result, c_result)
         });
         tasks.push(task);
@@ -346,11 +390,7 @@ async fn main() -> io::Result<()> {
     let mut output_file = BufWriter::new(file);
     let mut seen = HashSet::new();
 
-    for (_host, _url, mut a_result, mut b_result, mut c_result) in results {
-        let mut a_key = (a_result.status_code, a_result.content_length, a_result.word_count);
-        let mut b_key = (b_result.status_code, b_result.content_length, b_result.word_count);
-        let c_key = (c_result.status_code, c_result.content_length, c_result.word_count);
-
+    for (_host, _url, a_result, b_result, mut c_result) in results {
         if verbose {
             if let Some(error) = &a_result.error {
                 println!("Error for A ({}): {}", a_result.url, error);
@@ -363,75 +403,71 @@ async fn main() -> io::Result<()> {
             }
         }
 
-        if c_key.0 != a_key.0 || c_key.0 != b_key.0 || c_key.1 != a_key.1 || c_key.1 != b_key.1 {
-            // Calculate word counts for A and B only if C differs in status or content length
-            if a_result.status_code < 400 || a_result.status_code == 401 {
-                a_result.word_count = calculate_word_count(&client, &a_result.url, None, verbose).await;
-            }
-            if b_result.status_code < 400 || b_result.status_code == 401 {
-                b_result.word_count = calculate_word_count(&client, &b_result.url, None, verbose).await;
-            }
-            a_key = (a_result.status_code, a_result.content_length, a_result.word_count);
-            b_key = (b_result.status_code, b_result.content_length, b_result.word_count);
-
-            if c_key != a_key && c_key != b_key && is_valid_status(c_result.status_code) {
-                let mut title = String::new();
-                // Fetch C response for word count and title
-                let response = client
-                    .get(&c_result.url)
-                    .header("Host", &c_result.host)
-                    .header("User-Agent", "Mozilla/5.0 (compatible; sorted-vhost/1.0)")
-                    .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-                    .header("Connection", "keep-alive")
-                    .send()
-                    .await;
-                if let Ok(response) = response {
-                    let is_html = response
-                        .headers()
-                        .get("Content-Type")
-                        .map(|ct| ct.to_str().unwrap_or("").contains("text/html"))
-                        .unwrap_or(false);
-                    if is_html && c_result.content_length < 500_000 { // Reduced cap
-                        if let Ok(body) = response.text().await {
-                            let (word_count, extracted_title) = calculate_word_count_and_title(&body, verbose).await;
-                            c_result.word_count = word_count;
-                            title = extracted_title;
-                        }
-                    }
-                }
-
-                let key = format!("{}-{}", c_result.status_code, c_result.content_length);
-                if !seen.contains(&key) {
-                    seen.insert(key);
-                    writeln!(output_file, "{}", c_result.to_debug_format(&a_result, &b_result, &title))?;
-                    if verbose {
-                        println!(
-                            "Unique C: {} (A: {} CL:{} WC:{}, B: {} CL:{} WC:{}, C: {} CL:{} WC:{}) \"{}\"",
-                            c_result.to_tabular(),
-                            a_result.status_code, a_result.content_length, a_result.word_count,
-                            b_result.status_code, b_result.content_length, b_result.word_count,
-                            c_result.status_code, c_result.content_length, c_result.word_count,
-                            title
-                        );
-                    }
-                } else if verbose {
-                    println!("Skipped (duplicate key): {}", c_result.to_tabular());
-                }
-            } else if verbose {
+        // Skip if A redirect resulted in 200 on same site (marked as 999)
+        if a_result.status_code == 999 {
+            if verbose {
                 println!(
-                    "Skipped: {} (A: {} CL:{} WC:{}, B: {} CL:{} WC:{}, C: {} CL:{} WC:{})",
+                    "Skipped (A redirect to 200 on same site): {} (A: {} CL:{} WC:{}, B: {} CL:{} WC:{}, C: {} CL:{} WC:{})",
                     c_result.to_tabular(),
                     a_result.status_code, a_result.content_length, a_result.word_count,
                     b_result.status_code, b_result.content_length, b_result.word_count,
                     c_result.status_code, c_result.content_length, c_result.word_count
                 );
             }
+            continue;
+        }
+
+        if c_result.status_code != a_result.status_code && c_result.status_code != b_result.status_code && is_valid_status(c_result.status_code) {
+            let mut title = String::new();
+            // Fetch C response for word count and title
+            let response = client
+                .get(&c_result.url)
+                .header("Host", &c_result.host)
+                .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
+                .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8")
+                .header("Accept-Language", "en-US,en;q=0.5")
+                .header("Connection", "keep-alive")
+                .send()
+                .await;
+            if let Ok(response) = response {
+                let is_html = response
+                    .headers()
+                    .get("Content-Type")
+                    .map(|ct| ct.to_str().unwrap_or("").contains("text/html"))
+                    .unwrap_or(false);
+                if is_html && c_result.content_length < 500_000 {
+                    if let Ok(body) = response.text().await {
+                        let (word_count, extracted_title) = calculate_word_count_and_title(&body, verbose).await;
+                        c_result.word_count = word_count;
+                        title = extracted_title;
+                    }
+                }
+            }
+
+            let key = format!("{}-{}", c_result.status_code, c_result.content_length);
+            if !seen.contains(&key) {
+                seen.insert(key);
+                writeln!(output_file, "{}", c_result.to_debug_format(&a_result, &b_result, &title))?;
+                if verbose {
+                    println!(
+                        "Unique C: {} (A: {} CL:{} WC:{}, B: {} CL:{} WC:{}, C: {} CL:{} WC:{}) \"{}\"",
+                        c_result.to_tabular(),
+                        a_result.status_code, a_result.content_length, a_result.word_count,
+                        b_result.status_code, b_result.content_length, b_result.word_count,
+                        c_result.status_code, c_result.content_length, c_result.word_count,
+                        title
+                    );
+                }
+            } else if verbose {
+                println!("Skipped (duplicate key): {}", c_result.to_tabular());
+            }
         } else if verbose {
             println!(
-                "Skipped: {} (A: {} CL:{} WC:{}, B: {} CL:{} WC:{})",
+                "Skipped: {} (A: {} CL:{} WC:{}, B: {} CL:{} WC:{}, C: {} CL:{} WC:{})",
                 c_result.to_tabular(),
                 a_result.status_code, a_result.content_length, a_result.word_count,
-                b_result.status_code, b_result.content_length, b_result.word_count
+                b_result.status_code, b_result.content_length, b_result.word_count,
+                c_result.status_code, c_result.content_length, c_result.word_count
             );
         }
     }
