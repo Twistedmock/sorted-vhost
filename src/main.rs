@@ -146,7 +146,7 @@ async fn send_request(client: &Client, url: String, host: Option<&str>, verbose:
                 .and_then(|v| v.to_str().ok())
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(0);
-            let location = if status == 301 {
+            let location = if status >= 300 && status < 400 {
                 response
                     .headers()
                     .get("Location")
@@ -201,7 +201,6 @@ async fn follow_redirect(client: &Client, base_url: &str, location: &str, host: 
     let redirect_url = match Url::parse(location) {
         Ok(url) => url.to_string(),
         Err(_) => {
-            // Handle relative URLs
             match Url::parse(base_url).and_then(|base| base.join(location)) {
                 Ok(url) => url.to_string(),
                 Err(e) => {
@@ -222,25 +221,38 @@ async fn follow_redirect(client: &Client, base_url: &str, location: &str, host: 
         }
     };
 
-    // Check if redirect is on the same site
+    let is_full_url = redirect_url.starts_with("http://") || redirect_url.starts_with("https://");
     let base_apex = get_apex_domain(base_url);
     let redirect_apex = get_apex_domain(&redirect_url);
     let is_same_site = base_apex.is_some() && redirect_apex.is_some() && base_apex == redirect_apex;
 
     let redirect_result = send_request(client, redirect_url.clone(), None, verbose).await;
-    if redirect_result.status_code == 200 && is_same_site {
-        RequestResult {
+
+    if is_full_url && redirect_result.status_code != 200 {
+        return RequestResult {
             host: host.to_string(),
             url: redirect_url,
-            status_code: 999, // Special code to indicate skip
+            status_code: 998, // Non-accessible full URL
             content_length: 0,
             word_count: 0,
             error: None,
             location: None,
-        }
-    } else {
-        redirect_result
+        };
     }
+
+    if redirect_result.status_code == 200 && is_same_site {
+        return RequestResult {
+            host: host.to_string(),
+            url: redirect_url,
+            status_code: 999, // Same-site 200
+            content_length: 0,
+            word_count: 0,
+            error: None,
+            location: None,
+        };
+    }
+
+    redirect_result
 }
 
 async fn calculate_word_count_and_title(body: &str, verbose: bool) -> (usize, String) {
@@ -333,7 +345,7 @@ async fn main() -> io::Result<()> {
 
     let client = ClientBuilder::new()
         .danger_accept_invalid_certs(true)
-        .timeout(std::time::Duration::from_secs(5)) // Increased to 5s
+        .timeout(std::time::Duration::from_secs(5))
         .build()
         .expect("Failed to build HTTP client");
     let client = Arc::new(client);
@@ -360,7 +372,7 @@ async fn main() -> io::Result<()> {
             let _permit = semaphore.acquire().await.unwrap();
             let a_https = send_request(&client, https_url.clone(), None, verbose).await;
             let mut a_result = a_https;
-            if a_result.status_code == 301 {
+            if a_result.status_code >= 300 && a_result.status_code < 400 {
                 if let Some(location) = &a_result.location {
                     a_result = follow_redirect(&client, &https_url, location, &host, verbose).await;
                 }
@@ -403,11 +415,11 @@ async fn main() -> io::Result<()> {
             }
         }
 
-        // Skip if A redirect resulted in 200 on same site (marked as 999)
-        if a_result.status_code == 999 {
+        // Skip if A is 429
+        if a_result.status_code == 429 {
             if verbose {
                 println!(
-                    "Skipped (A redirect to 200 on same site): {} (A: {} CL:{} WC:{}, B: {} CL:{} WC:{}, C: {} CL:{} WC:{})",
+                    "Skipped (A status 429): {} (A: {} CL:{} WC:{}, B: {} CL:{} WC:{}, C: {} CL:{} WC:{})",
                     c_result.to_tabular(),
                     a_result.status_code, a_result.content_length, a_result.word_count,
                     b_result.status_code, b_result.content_length, b_result.word_count,
@@ -417,9 +429,29 @@ async fn main() -> io::Result<()> {
             continue;
         }
 
+        // Skip if A redirect resulted in 200 on same site or non-accessible full URL
+        if a_result.status_code == 999 || a_result.status_code == 998 {
+            if verbose {
+                let reason = if a_result.status_code == 999 {
+                    "A redirect to 200 on same site"
+                } else {
+                    "A redirect to non-accessible full URL"
+                };
+                println!(
+                    "Skipped ({}): {} (A: {} CL:{} WC:{}, B: {} CL:{} WC:{}, C: {} CL:{} WC:{})",
+                    reason,
+                    c_result.to_tabular(),
+                    a_result.status_code, a_result.content_length, a_result.word_count,
+                    b_result.status_code, b_result.content_length, b_result.word_count,
+                    c_result.status_code, c_result.content_length, c_result.word_count
+                );
+            }
+            continue;
+        }
+
+        let mut title = String::new();
+        // Fetch C response for word count and title
         if c_result.status_code != a_result.status_code && c_result.status_code != b_result.status_code && is_valid_status(c_result.status_code) {
-            let mut title = String::new();
-            // Fetch C response for word count and title
             let response = client
                 .get(&c_result.url)
                 .header("Host", &c_result.host)
@@ -440,6 +472,42 @@ async fn main() -> io::Result<()> {
                         let (word_count, extracted_title) = calculate_word_count_and_title(&body, verbose).await;
                         c_result.word_count = word_count;
                         title = extracted_title;
+
+                        // Skip if title matches specific values
+                        if title == "Request Rejected" || title == "Site en construction" || title == "Welcome to nginx!" || title == "Access Denied" {
+                            if verbose {
+                                println!(
+                                    "Skipped (title '{}'): {} (A: {} CL:{} WC:{}, B: {} CL:{} WC:{}, C: {} CL:{} WC:{})",
+                                    title,
+                                    c_result.to_tabular(),
+                                    a_result.status_code, a_result.content_length, a_result.word_count,
+                                    b_result.status_code, b_result.content_length, b_result.word_count,
+                                    c_result.status_code, c_result.content_length, c_result.word_count
+                                );
+                            }
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            // Skip if C is 3xx with non-accessible full URL
+            if c_result.status_code >= 300 && c_result.status_code < 400 && c_result.location.is_some() {
+                let location = c_result.location.as_ref().unwrap();
+                let is_full_url = location.starts_with("http://") || location.starts_with("https://");
+                if is_full_url {
+                    let redirect_result = send_request(&client, location.clone(), None, verbose).await;
+                    if redirect_result.status_code != 200 {
+                        if verbose {
+                            println!(
+                                "Skipped (C redirect to non-accessible full URL): {} (A: {} CL:{} WC:{}, B: {} CL:{} WC:{}, C: {} CL:{} WC:{})",
+                                c_result.to_tabular(),
+                                a_result.status_code, a_result.content_length, a_result.word_count,
+                                b_result.status_code, b_result.content_length, b_result.word_count,
+                                c_result.status_code, c_result.content_length, c_result.word_count
+                            );
+                        }
+                        continue;
                     }
                 }
             }
