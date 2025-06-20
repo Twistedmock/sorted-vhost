@@ -474,7 +474,21 @@ async fn main() -> io::Result<()> {
                         title = extracted_title;
 
                         // Skip if title matches specific values
-                        if title == "Request Rejected" || title == "Site en construction" || title == "Welcome to nginx!" || title == "Access Denied" {
+                        if [
+                            "Are you not a robot?",
+                            "302 Found",
+                            "404 Not Found",
+                            "418 I'm a teapot",
+                            "Request Rejected",
+                            "Page Not Found",
+                            "Document Moved",
+                            "Welcome to nginx!",
+                            "301 Moved Permanently",
+                            "Apache2 Ubuntu Default Page: It works",
+                            "Welcome to OpenResty!",
+                            "Site en construction",
+                            "Access Denied",
+                        ].contains(&title.as_str()) {
                             if verbose {
                                 println!(
                                     "Skipped (title '{}'): {} (A: {} CL:{} WC:{}, B: {} CL:{} WC:{}, C: {} CL:{} WC:{})",
